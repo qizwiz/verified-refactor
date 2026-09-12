@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""ts-refactor -- VERIFIED behavior-preserving refactoring: STRUCTURE proposes, the ORACLE disposes.
+
+The refactoring axis of thrash (JH 2026-09-12). Tree-sitter finds rewrite sites (the correct-by-
+construction generator); each candidate is APPLIED and GRADED by a SOUND ORACLE -- your `--test CMD`
+must still PASS *and* a cost metric (byte length) must DROP -- so ts-refactor can ONLY ever emit
+test-passing, smaller code. A rewrite that breaks behavior fails the test and is REVERTED.
+
+Behavioral equivalence of arbitrary code is UNDECIDABLE, so the rules are not "proven equivalences" --
+they are structurally-motivated rewrites, and the TEST SUITE is the un-fakeable equivalence oracle.
+The oracle is the achievement; the rules are the generator. (See thrash-structure-hott-monads keep.)
+
+  ts-refactor FILE --test 'CMD' [--lang python] [--max N] [--dry] [--timeout S]
+  ts-refactor --selftest        # proves it APPLIES a valid rewrite AND REJECTS a behavior-breaker
+
+Rules (Python, extensible registry):
+  aug-assign  :  x = x <op> y   ->  x <op>= y                 (name target; behavior-preserving)
+  neg-cmp     :  not (A <cmp> B) -> A <negcmp> B  for == != is 'is not' in 'not in'
+                 (ordered <,>,<=,>= are DELIBERATELY excluded: negation is NaN-unsafe;
+                  == <-> != is test-gated because a custom __ne__ can differ -- the oracle catches it.)
+"""
+
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import tree_sitter as ts
+from tree_sitter_language_pack import get_language, get_parser
+
+NEG_CMP = {
+    "==": "!=",
+    "!=": "==",
+    "is": "is not",
+    "is not": "is",
+    "in": "not in",
+    "not in": "in",
+}
+
+
+def _t(b, n):
+    return b[n.start_byte : n.end_byte].decode("utf-8", "replace")
+
+
+def _match_rule(pat, node, b, bnd):
+    """Structurally match a mined rule PATTERN (sexpr) against a live NODE; bind holes consistently."""
+    if pat[0] == "H":
+        src = b[node.start_byte : node.end_byte].decode("utf-8", "replace")
+        if pat[1] in bnd:
+            return bnd[pat[1]] == src
+        bnd[pat[1]] = src
+        return True
+    if pat[0] == "L":
+        return (
+            node.child_count == 0
+            and node.type == pat[1]
+            and b[node.start_byte : node.end_byte].decode("utf-8", "replace") == pat[2]
+        )
+    if node.type != pat[1] or len(node.children) != len(pat[2]):
+        return False
+    return all(_match_rule(p, k, b, bnd) for p, k in zip(pat[2], node.children))
+
+
+_QCACHE: dict = {}
+
+
+def _compiled_query(lang, qstr):
+    key = (lang, qstr)
+    if key not in _QCACHE:
+        _QCACHE[key] = ts.Query(get_language(lang), qstr)
+    return _QCACHE[key]
+
+
+def _query_candidates(tree, b, rule, lang):
+    """Match a mined rule via its NATIVE tree-sitter query: a repeated @hN capture is an equality
+    constraint, @_litN captures are text-pinned, @_whole is the rewrite span. Structure proposes;
+    the oracle still disposes. This is the homoiconic rule path (the rule IS a ts-query s-expr).
+    """
+    out = []
+    cur = ts.QueryCursor(_compiled_query(lang, rule["query"]))
+    for _pat, caps in cur.matches(tree.root_node):
+        if "_whole" not in caps:
+            continue
+        ok = True
+        hole_txt = {}
+        for name, nodes in caps.items():
+            texts = [_t(b, nd) for nd in nodes]
+            if name[:1] == "h" and name[1:].isdigit():
+                if len(set(texts)) != 1:  # a repeated hole must bind equal source
+                    ok = False
+                    break
+                hole_txt[int(name[1:])] = texts[0]
+            elif name.startswith("_lit"):
+                if texts[0] != rule.get("lits", {}).get(name):
+                    ok = False
+                    break
+        if not ok:
+            continue
+        rep = rule["template"]
+        for hid, txt in hole_txt.items():
+            rep = rep.replace("\x00%d\x00" % hid, txt)
+        w = caps["_whole"][0]
+        out.append(
+            (
+                w.start_byte,
+                w.end_byte,
+                rep,
+                "mined-q:%s L%d" % (rule["root"], w.start_point[0] + 1),
+            )
+        )
+    return out
+
+
+def find_candidates(tree, b, rules=(), lang="python"):
+    """Return [(start_byte, end_byte, replacement_str, label)] -- structural + mined-rule rewrites.
+    Mined rules with a native tree-sitter `query` match via the engine (once over the tree); legacy
+    `pattern`-only rules match per-node via _match_rule."""
+    out = []
+    qrules = [r for r in rules if r.get("query")]
+    prules = [r for r in rules if not r.get("query")]
+    for r in qrules:
+        out.extend(_query_candidates(tree, b, r, lang))
+
+    def walk(n):
+        if n.type == "assignment":
+            l = n.child_by_field_name("left")
+            r = n.child_by_field_name("right")
+            if l and r and l.type == "identifier" and r.type == "binary_operator":
+                rl = r.child_by_field_name("left")
+                rr = r.child_by_field_name("right")
+                ops = [c for c in r.children if not c.is_named]
+                if (
+                    rl
+                    and rl.type == "identifier"
+                    and _t(b, rl) == _t(b, l)
+                    and rr
+                    and len(ops) == 1
+                ):
+                    rep = "%s %s= %s" % (_t(b, l), _t(b, ops[0]), _t(b, rr))
+                    out.append(
+                        (
+                            n.start_byte,
+                            n.end_byte,
+                            rep,
+                            "aug-assign L%d" % (n.start_point[0] + 1),
+                        )
+                    )
+        if n.type == "not_operator":
+            arg = n.child_by_field_name("argument")
+            inner = arg
+            if inner and inner.type == "parenthesized_expression":
+                named = [c for c in inner.children if c.is_named]
+                inner = named[0] if named else None
+            if inner and inner.type == "comparison_operator":
+                named = [c for c in inner.children if c.is_named]
+                ops = [c for c in inner.children if not c.is_named]
+                if len(named) == 2 and len(ops) == 1:
+                    opt = _t(b, ops[0])
+                    if opt in NEG_CMP:
+                        rep = "%s %s %s" % (
+                            _t(b, named[0]),
+                            NEG_CMP[opt],
+                            _t(b, named[1]),
+                        )
+                        out.append(
+                            (
+                                n.start_byte,
+                                n.end_byte,
+                                rep,
+                                "neg-cmp(%s) L%d" % (opt, n.start_point[0] + 1),
+                            )
+                        )
+        if n.type == "not_operator":
+            inner2 = n.child_by_field_name("argument")
+            if inner2 and inner2.type == "not_operator":
+                x = inner2.child_by_field_name("argument")
+                if x:
+                    out.append(
+                        (
+                            n.start_byte,
+                            n.end_byte,
+                            "bool(%s)" % _t(b, x),
+                            "double-not L%d" % (n.start_point[0] + 1),
+                        )
+                    )
+        if n.type == "comparison_operator":
+            named = [c for c in n.children if c.is_named]
+            ops = [c for c in n.children if not c.is_named]
+            if len(named) == 2 and len(ops) == 1 and _t(b, ops[0]) in ("==", "is"):
+                for i, other in ((0, 1), (1, 0)):
+                    if named[i].type == "true":
+                        out.append(
+                            (
+                                n.start_byte,
+                                n.end_byte,
+                                _t(b, named[other]),
+                                "redundant-true L%d" % (n.start_point[0] + 1),
+                            )
+                        )
+                        break
+        for rule in prules:
+            if n.type == rule["root"]:
+                bnd: dict = {}
+                if _match_rule(rule["pattern"], n, b, bnd):
+                    rep = rule["template"]
+                    for i, v in bnd.items():
+                        rep = rep.replace("\x00%d\x00" % i, v)
+                    out.append(
+                        (
+                            n.start_byte,
+                            n.end_byte,
+                            rep,
+                            "mined:%s L%d" % (rule["root"], n.start_point[0] + 1),
+                        )
+                    )
+        for c in n.children:
+            walk(c)
+
+    walk(tree.root_node)
+    return out
+
+
+def run_test(cmd, timeout):
+    try:
+        return (
+            subprocess.run(
+                cmd, shell=True, capture_output=True, timeout=timeout
+            ).returncode
+            == 0
+        )
+    except Exception:
+        return False
+
+
+def refactor(
+    path, test_cmd, lang="python", timeout=120, dry=False, max_apply=100, rules=()
+):
+    parser = get_parser(lang)
+    p = Path(path)
+    orig = p.read_bytes()
+    if not dry and not run_test(test_cmd, timeout):
+        print(
+            json.dumps(
+                {
+                    "event": "HARNESS-ERROR",
+                    "control": "pristine",
+                    "note": "--test FAILS on the unmodified file; fix the oracle before refactoring",
+                }
+            )
+        )
+        return 2
+    cur = orig
+    applied, rejected = [], []
+    try:
+        for _ in range(max_apply + 5):
+            cands = find_candidates(parser.parse(cur), cur, rules, lang)
+            cands = [
+                c
+                for c in cands
+                if len(cur[: c[0]] + c[2].encode() + cur[c[1] :]) < len(cur)
+            ]
+            if dry:
+                for _sb, _eb, _rep, label in sorted(cands):
+                    print(json.dumps({"event": "candidate", "rule": label}))
+                break
+            progressed = False
+            for sb, eb, rep, label in sorted(cands):
+                newb = cur[:sb] + rep.encode() + cur[eb:]
+                p.write_bytes(newb)
+                if run_test(test_cmd, timeout):
+                    cur = newb
+                    applied.append(label)
+                    progressed = True
+                    print(
+                        json.dumps(
+                            {"event": "accept", "rule": label, "bytes": len(cur)}
+                        )
+                    )
+                    break
+                else:
+                    rejected.append(label)
+                    print(
+                        json.dumps(
+                            {
+                                "event": "reject",
+                                "rule": label,
+                                "reason": "broke the test suite",
+                            }
+                        )
+                    )
+            if not progressed or len(applied) >= max_apply:
+                break
+    finally:
+        p.write_bytes(orig if dry else cur)
+    print(
+        json.dumps(
+            {
+                "event": "done",
+                "applied": len(applied),
+                "rejected": len(rejected),
+                "bytes_before": len(orig),
+                "bytes_after": len(cur),
+                "saved": len(orig) - len(cur),
+                "rules": applied[:30],
+            }
+        )
+    )
+    return 0
+
+
+def selftest():
+    ok = True
+    with tempfile.TemporaryDirectory() as _td:
+        d = Path(_td)
+        # CASE A: a valid aug-assign IS applied and the test still passes.
+        src = d / "a.py"
+        src.write_text("def f(x):\n    x = x + 1\n    return x\n")
+        test = d / "test_a.py"
+        test.write_text("import a\ndef test(): assert a.f(1) == 2\n")
+        cmd = "cd %s && %s -c 'import test_a; test_a.test()'" % (d, sys.executable)
+        refactor(str(src), cmd, "python", 60, False, 100)
+        got = src.read_text()
+        caseA = "x += 1" in got and "x = x + 1" not in got
+        print(
+            "  %s CASE-A aug-assign applied + tests pass" % ("ok " if caseA else "FAIL")
+        )
+        ok = ok and caseA
+
+        # CASE B (the sound-gate proof): a neg-cmp rewrite that BREAKS behavior is REJECTED.
+        # A class with an inconsistent __ne__ makes `not (a == b)` != `a != b`; a test pins it.
+        src2 = d / "b.py"
+        src2.write_text(
+            "class W:\n"
+            "    def __eq__(self, o): return True\n"
+            "    def __ne__(self, o): return True\n"  # inconsistent on purpose
+            "def g():\n"
+            "    return not (W() == W())\n"  # -> False;  W()!=W() -> True  (differs!)
+        )
+        test2 = d / "test_b.py"
+        test2.write_text("import b\ndef test(): assert b.g() is False\n")
+        cmd2 = "cd %s && %s -c 'import test_b; test_b.test()'" % (d, sys.executable)
+        refactor(str(src2), cmd2, "python", 60, False, 100)
+        got2 = src2.read_text()
+        caseB = (
+            "not (W() == W())" in got2 and "W() != W()" not in got2
+        )  # rewrite was REVERTED
+        print(
+            "  %s CASE-B behavior-breaking neg-cmp REJECTED by the oracle"
+            % ("ok " if caseB else "FAIL")
+        )
+        ok = ok and caseB
+
+        # CASE C (the self-mining-bridge proof): a rule MINED by sx-mine from ONE example
+        # applies to a NEW instance never given to it, and is oracle-certified.
+        rule = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "sx-mine"), "y == False", "not y"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        src3 = d / "c.py"
+        src3.write_text(
+            "def h(flag):\n    return flag == False\n"
+        )  # a DIFFERENT instance
+        (d / "test_c.py").write_text(
+            "import c\ndef test(): assert c.h(False) is True\n"
+        )
+        cmd3 = "cd %s && %s -c 'import test_c; test_c.test()'" % (d, sys.executable)
+        refactor(str(src3), cmd3, "python", 60, False, 100, [json.loads(rule)])
+        caseC = (
+            "not flag" in src3.read_text()
+        )  # mined rule rewrote flag==False -> not flag
+        print(
+            "  %s CASE-C MINED rule -> new instance, oracle-certified"
+            % ("ok " if caseC else "FAIL")
+        )
+        ok = ok and caseC
+
+        # CASE D (native QUERY path + eq-constraint proof): a mined rule whose root
+        # (boolean_operator) NO hardcoded rule touches, so a rewrite is provably the ts-query
+        # path. The repeated @h0 capture must FIRE on `flag or flag` yet LEAVE `flag or other`.
+        ruleD = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "sx-mine"), "a or a", "a"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        src4 = d / "e.py"
+        src4.write_text(
+            "def m(flag, other):\n"
+            "    z = flag or flag\n"  # lhs==rhs -> query rule fires -> z = flag
+            "    w = flag or other\n"  # lhs!=rhs -> eq constraint blocks it
+            "    return z\n"
+        )
+        (d / "test_e.py").write_text(
+            "import e\ndef test(): assert e.m(True, False) is True\n"
+        )
+        cmd4 = "cd %s && %s -c 'import test_e; test_e.test()'" % (d, sys.executable)
+        refactor(str(src4), cmd4, "python", 60, False, 100, [json.loads(ruleD)])
+        got4 = src4.read_text()
+        caseD = "flag or flag" not in got4 and "flag or other" in got4
+        print(
+            "  %s CASE-D query-path eq-constraint (fires on x-or-x, not x-or-y)"
+            % ("ok " if caseD else "FAIL")
+        )
+        ok = ok and caseD
+    print("RESULT: %s -- 4/4 cases" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__.strip().split("\n\n")[0])
+        return 0
+    if a[0] == "--selftest":
+        return selftest()
+    path = a[0]
+    test_cmd = a[a.index("--test") + 1] if "--test" in a else None
+    if not test_cmd and "--dry" not in a:
+        print(
+            "ts-refactor: --test 'CMD' is required (the sound oracle)", file=sys.stderr
+        )
+        return 2
+    lang = a[a.index("--lang") + 1] if "--lang" in a else "python"
+    timeout = int(a[a.index("--timeout") + 1]) if "--timeout" in a else 120
+    max_apply = int(a[a.index("--max") + 1]) if "--max" in a else 100
+    rules = []
+    if "--rules" in a:
+        with open(a[a.index("--rules") + 1]) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    rules.append(json.loads(line))
+    return refactor(path, test_cmd, lang, timeout, "--dry" in a, max_apply, rules)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

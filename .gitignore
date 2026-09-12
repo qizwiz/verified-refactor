@@ -1,4 +1,9 @@
+.venv-ship/
+.venv/
 __pycache__/
+*.pyc
 .mypy_cache/
 .ruff_cache/
-.live-check/
+*.orig
+bench/last-receipt.json
+*.orig

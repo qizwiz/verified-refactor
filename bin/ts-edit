@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""ts-edit FILE 'FORM' -- structural editing with NO EDITOR, via tree-sitter byte spans.
+
+WHY. `emacs-edit --op` addresses code the right way -- by the NAME of a definition rather than by
+quoting bytes that a formatter will reflow -- and 53% of one session's 549 real edit pairs re-emitted
+an anchor purely to say WHERE, with 66 runs refused for a stale one. But that addressing is bound to
+Emacs: it needs Emacs RUNNING, the nerve UP, and it answers inside a 6s reply ceiling that a large
+file can exceed. None of those hold on the box, in a subagent, in CI, or when Emacs is wedged --
+which is exactly when an edit still has to land.
+
+TREE-SITTER IS THE PORTABLE HALF, and the chassis is already proven here: ts-thrash mutates python,
+go, bash and elisp by splicing BYTE SPANS of the ORIGINAL bytes. Same move, pointed at edits instead
+of mutants. Splicing original bytes (never an unparse) is what keeps comments, blank lines and
+formatting intact, and makes it impossible to hit the wrong site the way a string replace can.
+
+STANDALONE. This is the portable, self-contained build: it depends only on tree-sitter and a
+SIBLING sexpr_lib.py, never on ~/bin, an Emacs, or the nerve. It writes directly to disk. The
+companion Emacs backend (emacs-edit) knows things a grammar does not -- format-on-save, flycheck,
+the buffer a human is looking at -- and where both exist in the full substrate a `--differential`
+run proves the two agree op-for-op; that cross-check needs both backends, so it lives there, not
+here (this build's `--differential` says so and exits).
+
+ONE VOCABULARY, PINNED. The form syntax comes from sexpr_lib (the shared reader). The op names and
+arities are an INLINE COPY of emacs-edit's OPS table (see OPS below). A copy can drift from the
+original -- the two-lists bug -- so check_grammar and the selftest pin the implemented ops against
+that table on every run, and emacs-edit's OPS stays the canonical source to keep it in step with.
+
+    ts-edit foo.py '(insert-in-defun "collect" "return" "    out.append(1)")'
+    ts-edit --stdout f.go '(replace-in-defun "Top" "a" "b")'   # print, do not write
+    ts-edit --defun foo.py Box.collect                         # SERVE one definition's source (byte-precise, by name)
+"""
+
+import io
+import os
+import re
+import sys
+import tempfile
+
+# STANDALONE. The shared s-expr reader is a SIBLING of this file, put on the path by a location
+# RELATIVE TO __file__ -- never ~/bin. This one line is what lets the tool run with no substrate
+# present (the box, CI, a subagent, a plain checkout of this repo).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import tree_sitter as ts  # noqa: E402
+from tree_sitter_language_pack import get_language, get_parser  # noqa: E402
+
+# THE SHARED OP GRAMMAR, INLINED. emacs-edit owns the canonical (op -> arity) table; this is a
+# verbatim copy of it with the elisp implementation functions dropped, because they live in IMPL
+# below. A copy CAN drift from the original -- that is the two-lists bug this file is most exposed
+# to -- so check_grammar and the selftest pin IMPL against this table, and when the two trees are
+# rejoined emacs-edit.OPS stays the canonical source this must be kept in step with.
+OPS: dict = {
+    "rename-symbol": 2,
+    "replace-in-defun": 3,
+    "insert-after-defun": 2,
+    "append-to-defun": 2,
+    "insert-in-defun": 3,
+    "delete-defun": 1,
+}
+
+
+def validate_op(form):
+    """PURE. A parsed s-expr -> (head, args, error), against the shared OPS grammar.
+
+    A verbatim copy of emacs-edit.validate_op: the whitelist is the safety boundary, so an unknown
+    head, a wrong arity, or a non-string argument is refused here before any splice runs. Inlined
+    rather than imported so the locator needs no ~/bin on the path.
+    """
+    if not isinstance(form, list) or not form:
+        return (None, None, "not an s-expr form")
+    head = form[0]
+    if not isinstance(head, str) or head not in OPS:
+        return (
+            None,
+            None,
+            "unknown op %r -- known: %s" % (head, ", ".join(sorted(OPS))),
+        )
+    arity = OPS[head]
+    args = form[1:]
+    if len(args) != arity:
+        return (
+            None,
+            None,
+            "%s takes %d argument(s), got %d" % (head, arity, len(args)),
+        )
+    if not all(isinstance(a, str) for a in args):
+        return (None, None, "%s takes string arguments only" % head)
+    return (head, [str(a) for a in args], "")
+
+
+def _read_sexpr(s):
+    """I/O-ish: the SHARED reader (the sibling sexpr_lib.py), never a second private parser."""
+    import sexpr_lib
+
+    return sexpr_lib.read(s)
+
+
+# EXTENSION -> GRAMMAR. Deliberately small: a language earns a row by having its definition shape
+# MEASURED (see --selftest), never by being plausible. An unknown extension refuses rather than
+# guessing, because a wrong grammar parses to one giant ERROR node and every span would be wrong.
+EXT = {
+    ".py": "python",
+    ".go": "go",
+    ".el": "elisp",
+    ".sh": "bash",
+    ".bash": "bash",
+}
+
+# WHAT COUNTS AS A DEFINITION, per language, measured by parsing a sample and reading the node types
+# off the tree rather than recalling them (probe output is in the --selftest cases below):
+#   python  class_definition / function_definition   -> field "name"
+#   go      function_declaration / method_declaration -> field "name"; type_declaration -> type_spec
+#   elisp   function_definition (defun) -> field "name"; special_form (defvar) -> child symbol
+#   bash    function_definition          -> field "name"
+LANGS: dict = {
+    "python": dict(
+        defs={"function_definition", "class_definition"},
+        containers={"class_definition"},
+        idents={"identifier"},
+        fallback=None,
+    ),
+    "go": dict(
+        defs={"function_declaration", "method_declaration", "type_declaration"},
+        containers=set(),
+        idents={
+            "identifier",
+            "field_identifier",
+            "type_identifier",
+            "package_identifier",
+        },
+        fallback="go_type_spec",
+    ),
+    "elisp": dict(
+        defs={"function_definition", "special_form"},
+        containers=set(),
+        idents={"symbol"},
+        fallback="elisp_head_symbol",
+    ),
+    "bash": dict(
+        defs={"function_definition"},
+        containers=set(),
+        idents={"word", "variable_name"},
+        fallback=None,
+    ),
+}
+
+# elisp heads that DEFINE a name. `special_form` covers both (defvar x 1) and (if a b), so without
+# this list an `if` would be indexed as a definition called by its condition -- a wrong address that
+# still resolves, which is worse than no address at all.
+_ELISP_DEFINING = {
+    "defvar",
+    "defconst",
+    "defcustom",
+    "defmacro",
+    "defsubst",
+    "defgroup",
+    "defface",
+}
+
+
+def _check_kind(path):
+    """I/O. A SHEBANG sniff for extensionless files, returning an extension-shaped key ('.py') or
+    None -- so this tool (itself extensionless) and the 200-odd like it still resolve to a grammar.
+
+    LOCAL, not ~/bin/check. The standalone build cannot reach that tool, so the one lesson worth
+    carrying is inlined rather than imported: require the line to actually START with '#!' and match
+    the interpreter's BASENAME, never a substring -- a prose file whose first line merely contains
+    'sh' is not a shell script. `/usr/bin/env python3` is unwrapped to its real interpreter. On any
+    read error this returns None, and the caller then reports 'no grammar' rather than guessing.
+    """
+    try:
+        with open(path, "rb") as fh:
+            first = fh.readline(256).decode("utf-8", "replace")
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return None
+    toks = first[2:].split()
+    if not toks:
+        return None
+    interp = os.path.basename(toks[0])
+    if interp == "env" and len(toks) > 1:
+        interp = os.path.basename(toks[1])
+    interp = interp.lower()
+    if interp.startswith("python"):
+        return ".py"
+    if interp in ("bash", "sh", "zsh"):
+        return ".sh"
+    return None
+
+
+def lang_of(path):
+    """PURE-ish. Path -> grammar name, or None.
+
+    Extension first, then the shebang. Nothing beyond that: a mis-detect would select the WRONG
+    grammar, and a wrong grammar does not fail loudly -- it parses the file into one giant ERROR
+    node, after which every byte span is meaningless. Refusing beats guessing.
+    """
+    ext = os.path.splitext(path)[1]
+    if ext in EXT:
+        return EXT[ext]
+    return EXT.get(_check_kind(path) or "")
+
+
+def _name_of(node, lang):
+    """PURE. A definition node -> its name, or None.
+
+    The `name` FIELD is the primary route and covers python, bash, and both go function shapes plus
+    elisp defun. The fallbacks exist because two real shapes do not carry one, and both were found
+    by parsing a sample rather than assumed.
+    """
+    f = node.child_by_field_name("name")
+    if f is not None:
+        return f.text.decode("utf-8", "replace")
+    fb = LANGS[lang]["fallback"]
+    if fb == "go_type_spec":
+        for ch in node.children:
+            if ch.type == "type_spec":
+                n = ch.child_by_field_name("name")
+                if n is not None:
+                    return n.text.decode("utf-8", "replace")
+    if fb == "elisp_head_symbol":
+        kids = [c for c in node.children if c.type not in ("(", ")")]
+        if (
+            len(kids) >= 2
+            and kids[0].type in _ELISP_DEFINING
+            and kids[1].type == "symbol"
+        ):
+            return kids[1].text.decode("utf-8", "replace")
+    return None
+
+
+def definitions(src, lang):
+    """PURE. bytes -> [(qualname, node)] for every definition, nested ones QUALIFIED by container.
+
+    A method inside a class is indexed as "Class.method" AND reachable as "method", mirroring the
+    Emacs backend's imenu matcher exactly (which accepts the bare name, "name (kind)", or a dotted
+    suffix). Two backends that disagree about what a name REFERS TO would be far worse than two that
+    disagree about where a line lands.
+    """
+    spec = LANGS[lang]
+    out = []
+
+    def walk(node, prefix):
+        for ch in node.children:
+            nm = None
+            if ch.type in spec["defs"]:
+                nm = _name_of(ch, lang)
+            if nm is not None:
+                qual = prefix + nm
+                out.append((qual, ch))
+                walk(ch, qual + "." if ch.type in spec["containers"] else prefix)
+            else:
+                walk(ch, prefix)
+
+    walk(get_parser(lang).parse(src).root_node, "")
+    return out
+
+
+def locate(defs, name):
+    """PURE. [(qualname, node)], name -> (node, error).
+
+    REFUSES ON AMBIGUITY, which is the whole reason to address by name at all: two definitions
+    answering to one name is the anchor problem in a new costume, and picking one silently would
+    edit a function the caller never named.
+    """
+    hits = [n for (q, n) in defs if q == name or q.endswith("." + name)]
+    if not hits:
+        return (None, "no-such-definition")
+    if len(hits) > 1:
+        # THE REFUSAL NAMES THE CANDIDATES, because a bare "ambiguous" is a dead end and this is a
+        # dead end with an exit: a query op CAN select the node type, so saying which types collided
+        # turns the refusal into the next command. Measured on the real corpus rather than guessed
+        # at -- 3 of 1166 names across 83 elisp files are ambiguous, all of them a defun and a
+        # defvar sharing a name, which is legal because elisp keeps functions and variables in
+        # SEPARATE namespaces. Rare enough that a namespace qualifier would be premature; common
+        # enough that the error has to be actionable when it fires.
+        return (
+            None,
+            "ambiguous-definition: %d matches (%s) -- a bare name cannot choose between them. "
+            "Use a query op, which can select the node type."
+            % (
+                len(hits),
+                ", ".join("%s @L%d" % (n.type, n.start_point[0] + 1) for n in hits),
+            ),
+        )
+    return (hits[0], "")
+
+
+def _line_start(src, pos):
+    """PURE. Index of the first byte on pos's line (Emacs `beginning-of-line`)."""
+    nl = src.rfind(b"\n", 0, pos)
+    return 0 if nl < 0 else nl + 1
+
+
+def _eol(src, pos):
+    """PURE. Index of the newline ending pos's line, or len (Emacs `end-of-line`)."""
+    nl = src.find(b"\n", pos)
+    return len(src) if nl < 0 else nl
+
+
+def after_defun(src, node):
+    """PURE. The analogue of Emacs `end-of-defun`: the START OF THE LINE AFTER the definition.
+
+    NOT node.end_byte, and the difference is exactly one newline. end_byte stops after the last
+    token; end-of-defun steps past the line. Using end_byte for delete-defun would leave a stranded
+    blank line, and for insert-after-defun would splice into the middle of a line. In the full
+    substrate this was bound against the live Emacs backend by --differential; that cross-check
+    needs both backends and lives there, not in this standalone build.
+    """
+    e = _eol(src, node.end_byte)
+    return min(len(src), e + 1)
+
+
+def op_rename_symbol(src, defs, args, lang):
+    """PURE. Rename every IDENTIFIER named old. Returns (newsrc, count, error).
+
+    DELIBERATE DIVERGENCE FROM THE EMACS BACKEND, declared here and pinned by the selftest case
+    `rename-does-NOT-touch-a-comment` so it cannot rot into a surprise (in the full substrate a
+    --differential case pins it too). Emacs renames with a `\\_<...\\_>` regexp, which also rewrites
+    the name inside STRINGS and COMMENTS. This walks the parse tree and touches identifier nodes
+    only. The grammar's answer is the more correct one -- a docstring mentioning `foo` is prose, not
+    a reference -- but "more correct" is still different, and a caller must be told which it gets.
+    """
+    old, new = args
+    spec = LANGS[lang]
+    tree = get_parser(lang).parse(src)
+    spans = []
+
+    def walk(n):
+        if n.type in spec["idents"] and n.text == old.encode():
+            spans.append((n.start_byte, n.end_byte))
+        for c in n.children:
+            walk(c)
+
+    walk(tree.root_node)
+    out, prev = [], 0
+    for a, b in sorted(spans):
+        out.append(src[prev:a])
+        out.append(new.encode())
+        prev = b
+    out.append(src[prev:])
+    return (b"".join(out), len(spans), "")
+
+
+def _scoped(src, defs, name):
+    """PURE. name -> (node, begin, limit, error). The shared locate-and-bound preamble, so all five
+    scoped ops have ONE definition of 'find the thing called X and where it ends'."""
+    node, err = locate(defs, name)
+    if err:
+        return (None, 0, 0, err)
+    return (node, node.start_byte, after_defun(src, node), "")
+
+
+def op_replace_in_defun(src, defs, args, lang):
+    """PURE. Textual replace bounded by ONE definition. Returns (newsrc, count, error).
+
+    The scope is what makes a weak needle safe: `old` only has to be unique inside one function.
+    """
+    name, old, new = args
+    node, beg, lim, err = _scoped(src, defs, name)
+    if err:
+        return (src, None, err)
+    region = src[beg:lim]
+    n = region.count(old.encode())
+    return (src[:beg] + region.replace(old.encode(), new.encode()) + src[lim:], n, "")
+
+
+def op_insert_after_defun(src, defs, args, lang):
+    """PURE. Place new code AFTER a definition -- the 'add a function' case, which under string
+    anchors needs an anchor on code that is not even changing."""
+    name, text = args
+    node, beg, lim, err = _scoped(src, defs, name)
+    if err:
+        return (src, None, err)
+    return (src[:lim] + b"\n" + text.encode() + b"\n" + src[lim:], len(text), "")
+
+
+def op_insert_in_defun(src, defs, args, lang):
+    """PURE. Insert INSIDE a definition, immediately before the first line matching a regexp.
+
+    THE SHAPE THAT ACTUALLY FITS THE WORK: append-to-defun puts code after a trailing `return`,
+    where it is unreachable -- proven by running it, not by reading it. Refuses when the landmark is
+    absent, because inserting at a default position would mean acting on a belief about the function
+    that has just been shown to be wrong.
+    """
+    name, before_re, text = args
+    node, beg, lim, err = _scoped(src, defs, name)
+    if err:
+        return (src, None, err)
+    try:
+        rx = re.compile(before_re.encode())
+    except re.error as e:
+        return (src, None, "bad-regexp: %s" % e)
+    m = rx.search(src, beg, lim)
+    if not m:
+        return (src, None, "no-line-matching-in-defun")
+    at = _line_start(src, m.start())
+    return (src[:at] + text.encode() + b"\n" + src[at:], len(text), "")
+
+
+def op_append_to_defun(src, defs, args, lang):
+    """PURE. Append at the END OF THE BODY -- inside the definition, not after it.
+
+    LIMIT, kept identical to the Emacs backend's: 'end of body' is AFTER any trailing `return`, so
+    in a function that returns this appends unreachable code. Use insert-in-defun for those.
+    """
+    name, text = args
+    node, beg, lim, err = _scoped(src, defs, name)
+    if err:
+        return (src, None, err)
+    at = _eol(src, node.end_byte)
+    return (src[:at] + b"\n" + text.encode() + src[at:], len(text), "")
+
+
+def op_delete_defun(src, defs, args, lang):
+    """PURE. Remove a whole definition, bounded by the grammar rather than by me guessing where it
+    ends."""
+    (name,) = args
+    node, beg, lim, err = _scoped(src, defs, name)
+    if err:
+        return (src, None, err)
+    return (src[:beg] + src[lim:], True, "")
+
+
+def _captures(src, lang, query_src, cap):
+    """PURE-ish. (query source, capture name) -> (spans, error).
+
+    THE OPEN ADDRESS, and the reason it belongs here. The six named ops above are compiled common
+    cases; a fixed verb list means a model can only say things someone anticipated. tree-sitter's
+    query language is ITSELF s-expressions, so an arbitrary structural address needs no new syntax
+    and no new parser -- "every function whose name starts with test_", "the else branch", "every
+    call to os.system" are all expressible without anyone having minted a verb for them.
+
+    THE WHITELIST WAS NEVER ABOUT THIS LAYER. emacs-edit refuses unknown heads because its executor
+    is `eval` of elisp over the nerve, where an unrecognised form is arbitrary code execution. Here
+    the executor is a byte splice, which cannot execute anything -- so the gate that matters is not
+    "is this verb on my list" but "does the result still parse", which the grammar answers for free.
+
+    ERRORS ARE RETURNED, NOT RAISED, because a malformed query is the NORMAL case in a loop where a
+    model writes the query: the message is the feedback that makes the next attempt better, and a
+    traceback is the one response that carries none.
+    """
+    try:
+        q = ts.Query(get_language(lang), query_src)
+    except Exception as e:
+        return (None, "bad-query: %s" % e)
+    try:
+        caps = ts.QueryCursor(q).captures(get_parser(lang).parse(src).root_node)
+    except Exception as e:
+        return (None, "query-failed: %s" % e)
+    if cap not in caps or not caps[cap]:
+        # A TYPO AND AN EMPTY RESULT ARRIVE LOOKING IDENTICAL, and they need opposite responses.
+        # A predicate that filters every match out removes the capture KEY entirely, so `@x` with
+        # `(#eq? @x "absent")` is indistinguishable from a misspelt capture name by the result
+        # alone -- measured, not assumed: it returned "no-such-capture" for a name the query
+        # plainly contains. The query SOURCE settles it, because a capture it never mentions
+        # cannot have matched nothing; it never existed. One says "fix the name", the other says
+        # "your belief about the file was wrong", and a loop that confuses them retries forever.
+        if ("@" + cap) in query_src:
+            return (None, "query-matched-nothing")
+        return (
+            None,
+            "no-such-capture %r -- this query captured: %s"
+            % (cap, ", ".join("@" + c for c in sorted(caps)) or "nothing"),
+        )
+    return (sorted((n.start_byte, n.end_byte) for n in caps[cap]), "")
+
+
+def _splice(src, spans, fn):
+    """PURE. Replace each span with fn(original bytes).
+
+    Every offset is read from the ORIGINAL bytes and applied left to right, so no edit can shift
+    another one's address. That is what makes a multi-site edit safe here and unsafe as a sequence
+    of string replaces -- the second replace in a sequence addresses a file the first one moved.
+    """
+    out, prev = [], 0
+    for a, b in spans:
+        out.append(src[prev:a])
+        out.append(fn(src[a:b]))
+        prev = b
+    out.append(src[prev:])
+    return b"".join(out)
+
+
+def op_query_replace(src, defs, args, lang):
+    """PURE. Replace the text of every node captured as @CAP with NEW."""
+    query_src, cap, new = args
+    spans, err = _captures(src, lang, query_src, cap)
+    if err:
+        return (src, None, err)
+    return (_splice(src, spans, lambda _b: new.encode()), len(spans), "")
+
+
+def op_query_delete(src, defs, args, lang):
+    """PURE. Delete every node captured as @CAP."""
+    query_src, cap = args
+    spans, err = _captures(src, lang, query_src, cap)
+    if err:
+        return (src, None, err)
+    return (_splice(src, spans, lambda _b: b""), len(spans), "")
+
+
+def op_query_insert_before(src, defs, args, lang):
+    """PURE. Insert TEXT on its own line before the LINE each capture starts on.
+
+    Line-anchored rather than byte-anchored because the real use is adding a statement, a decorator
+    or a guard, and a mid-line splice produces a syntax error the gate then refuses -- a correct
+    refusal that tells the caller nothing about what they actually wanted. Duplicate line starts
+    collapse, so two captures on one line insert once rather than twice.
+    """
+    query_src, cap, text = args
+    spans, err = _captures(src, lang, query_src, cap)
+    if err:
+        return (src, None, err)
+    starts = sorted({_line_start(src, a) for (a, _b) in spans})
+    return (
+        _splice(src, [(s, s) for s in starts], lambda _b: text.encode() + b"\n"),
+        len(starts),
+        "",
+    )
+
+
+# THE EXTENSION SET: ops this backend has and emacs-edit does not, because they have no meaning
+# without a grammar. Declared EXPLICITLY so the drift guard can tell a deliberate capability
+# difference from a silent divergence. emacs-edit refuses these BY NAME ("unknown op ..."), which
+# is an honest refusal rather than a wrong action -- the property that makes the difference safe.
+EXTRA = {
+    "query-replace": 3,
+    "query-delete": 2,
+    "query-insert-before": 3,
+}
+
+
+IMPL = {
+    "query-replace": op_query_replace,
+    "query-delete": op_query_delete,
+    "query-insert-before": op_query_insert_before,
+    "rename-symbol": op_rename_symbol,
+    "replace-in-defun": op_replace_in_defun,
+    "insert-after-defun": op_insert_after_defun,
+    "append-to-defun": op_append_to_defun,
+    "insert-in-defun": op_insert_in_defun,
+    "delete-defun": op_delete_defun,
+}
+
+
+def check_grammar(ops_table):
+    """PURE. IMPL vs the inlined OPS -> list of disagreements.
+
+    THE TWO-LISTS GUARD, made mechanical. This file exists to be a second implementation of someone
+    else's grammar, so the failure mode is not hypothetical: an op added to emacs-edit and not here
+    would be accepted by one backend and refused by the other, and nothing else would notice.
+    """
+    bad = []
+    for head in sorted(ops_table):
+        if head not in IMPL:
+            bad.append("%s: in emacs-edit OPS, MISSING here" % head)
+    for head in sorted(IMPL):
+        if head not in ops_table and head not in EXTRA:
+            bad.append(
+                "%s: implemented here, not in emacs-edit OPS nor declared in EXTRA"
+                % head
+            )
+    return bad
+
+
+def validate(form, ops_table):
+    """PURE. A parsed form -> (head, args, error), against the shared grammar OR this backend's
+    declared extensions.
+
+    The shared half is DELEGATED to the inlined validate_op (a verbatim copy of emacs-edit's) so
+    "what is a legal form" keeps one answer; only EXTRA heads are judged here, and by the same three
+    rules it uses -- known head, exact arity, strings only.
+    """
+    if (
+        isinstance(form, list)
+        and form
+        and isinstance(form[0], str)
+        and form[0] in EXTRA
+    ):
+        head, args = form[0], form[1:]
+        if len(args) != EXTRA[head]:
+            return (
+                None,
+                None,
+                "%s takes %d argument(s), got %d" % (head, EXTRA[head], len(args)),
+            )
+        if not all(isinstance(a, str) for a in args):
+            return (None, None, "%s takes string arguments only" % head)
+        return (head, [str(a) for a in args], "")
+    return validate_op(form)
+
+
+def apply_form(src, lang, form, ops_table):
+    """PURE. bytes, grammar, parsed form -> (newsrc, result, error).
+
+    Validation goes through the inlined validate_op, so 'what is a legal form' has one answer.
+    """
+    head, args, err = validate(form, ops_table)
+    if err:
+        return (src, None, err)
+    if head not in IMPL:
+        return (src, None, "op %s not implemented in the tree-sitter backend" % head)
+    before_ok = not get_parser(lang).parse(src).root_node.has_error
+    new, res, err = IMPL[head](src, definitions(src, lang), args, lang)
+    if err:
+        return (src, None, err)
+    # THE SYNTAX GATE, and it is free here in a way it is not anywhere else: the same grammar that
+    # located the definition also says whether the RESULT still parses. Refusing only when the file
+    # was clean BEFORE means editing an already-broken file stays possible -- otherwise the one
+    # tool that could repair it would be the one refusing to.
+    if before_ok and get_parser(lang).parse(new).root_node.has_error:
+        return (src, None, "edit-introduced-a-syntax-error")
+    return (new, res, "")
+
+
+def _write(path, new):
+    """I/O. Write bytes DIRECTLY to the file. -> (route, error).
+
+    STANDALONE: a plain direct write, which the module docstring already named as the no-nerve case.
+    The cooperative through-the-live-buffer route (and the nerve-eval liveness probe it needed) was
+    the one genuine substrate coupling in the write half, and it is removed here -- this build does
+    not assume an Emacs is running, so there is no open buffer to go stale and nothing to write
+    through. The route is still reported so callers keep a stable contract; it is always 'direct'.
+    """
+    open(path, "wb").write(new)
+    return ("direct", "")
+
+
+def edit_file(path, form_str, write=True, out=None):
+    """I/O. Apply one form to one file. Returns (rc, message)."""
+    if not os.path.exists(path):
+        return (1, "no-such-file: %s" % path)
+    lang = lang_of(path)
+    if lang is None:
+        return (1, "no grammar for %s -- known: %s" % (path, ", ".join(sorted(EXT))))
+    try:
+        form = _read_sexpr(form_str)
+    except Exception as e:
+        return (1, "unreadable form: %s" % e)
+    src = open(path, "rb").read()
+    ops_table = OPS
+    drift = check_grammar(ops_table)
+    if drift:
+        return (1, "OP GRAMMAR DRIFT -- refusing:\n  " + "\n  ".join(drift))
+    new, res, err = apply_form(src, lang, form, ops_table)
+    if err:
+        return (1, "FAILED -- %s" % err)
+    if new == src:
+        # A no-op edit is a belief about the file that did not hold. Reporting success would let a
+        # caller move on as though the change landed.
+        return (
+            1,
+            "FAILED -- op made no change (the form matched nothing that differs)",
+        )
+    if write:
+        route, werr = _write(path, new)
+        if werr:
+            return (1, "FAILED -- %s" % werr)
+        # THE ROUTE IS REPORTED, not silent. "It wrote" and "it wrote where an editor will see it"
+        # are different facts, and only one of them is safe on a machine running Emacs.
+        return (
+            0,
+            "ok %s -> %r (%d bytes) via %s" % (lang, res, len(new) - len(src), route),
+        )
+    # THE SINK IS INJECTED, so the no-write path is testable at all. With the stream hard-coded,
+    # the suite's own --stdout case printed the entire fixture into the middle of the results --
+    # a branch that cannot be exercised without corrupting the report is a branch nobody tests.
+    (out or sys.stdout.buffer).write(new)
+    return (0, "")
+
+
+FIXTURES = {
+    "python": b'''"""Mod."""
+
+
+class Box:
+    def collect(self):
+        out = []
+        out.append("first")
+        return out
+
+
+def top(a):
+    # collect is mentioned here in a comment
+    return a + 1
+''',
+    "go": b"""package p
+
+func Top(a int) int {
+\treturn a
+}
+
+type T struct{}
+""",
+    "elisp": b"""(defun my-fn (a)
+  "Doc."
+  (+ a 1))
+
+(defvar my-var 3)
+""",
+    "bash": b"""top() {
+  echo hi
+}
+""",
+}
+
+
+def selftest():
+    fails = []
+
+    ran = []
+
+    def check(name, cond):
+        # THE DENOMINATOR IS COUNTED, NOT DECLARED. `n = 26` was a second source of truth about how
+        # many cases exist, and it drifts the moment a case is added -- the two-lists bug inside the
+        # one function whose job is to be trustworthy. A floor below still catches a suite that
+        # silently stops running cases, which is the failure a derived count cannot see on its own.
+        ran.append(name)
+        if not cond:
+            fails.append(name)
+
+    # THE GRAMMAR IS SHARED, NOT COPIED -- if this fails the two backends have diverged and every
+    # other case below is measuring a vocabulary nobody else speaks.
+    check("op-grammar-agrees-with-emacs-edit", check_grammar(OPS) == [])
+    # DERIVED, not counted. `len(IMPL) == 6` was a hardcoded total that went stale the moment the
+    # extension set arrived -- the same declared-denominator bug as `n = 26`, one table over.
+    check(
+        "every-shared-op-and-extension-is-implemented",
+        set(IMPL) == set(OPS) | set(EXTRA),
+    )
+
+    # EVERY LANGUAGE ROW IS MEASURED, not declared. A grammar that stopped naming definitions the
+    # way this file believes would otherwise fail as "no-such-definition" on real work.
+    for lang, want in (
+        ("python", {"Box", "Box.collect", "top"}),
+        ("go", {"Top", "T"}),
+        ("elisp", {"my-fn", "my-var"}),
+        ("bash", {"top"}),
+    ):
+        got = {q for (q, _) in definitions(FIXTURES[lang], lang)}
+        check("%s-definitions-found (%s)" % (lang, sorted(got)), got == want)
+
+    py = FIXTURES["python"]
+    defs = definitions(py, "python")
+
+    # A METHOD IS REACHABLE BY ITS BARE NAME, mirroring the Emacs matcher.
+    check("bare-name-reaches-a-method", locate(defs, "collect")[1] == "")
+    check("qualified-name-reaches-it-too", locate(defs, "Box.collect")[1] == "")
+    check("unknown-name-refuses", locate(defs, "nope")[1] == "no-such-definition")
+
+    # AMBIGUITY MUST REFUSE. Without this case the suite cannot tell 'picks the right one' from
+    # 'picks the first one', which is the anchor bug wearing a name.
+    dup = b"def f():\n    return 1\n\n\nclass C:\n    def f(self):\n        return 2\n"
+    amb = locate(definitions(dup, "python"), "f")[1]
+    check("ambiguous-name-refuses", amb.startswith("ambiguous-definition"))
+    # ...and the refusal must NAME the candidates, or the caller has no next move. Split from the
+    # case above rather than joined with `and`, because mutation proved a compound assertion
+    # survives being weakened to `or`.
+    check("ambiguous-refusal-names-the-candidates", "@L1" in amb and "@L6" in amb)
+
+    # THE REACHABILITY CASE that append-to-defun failed for real: inserted code must land BEFORE the
+    # return, and the proof is that the function's VALUE changes, not that bytes moved.
+    new, res, err = apply_form(
+        py,
+        "python",
+        ["insert-in-defun", "collect", "return out", '        out.append("second")'],
+        OPS,
+    )
+    check("insert-in-defun-applies", err == "" and res == 28)
+    ns: dict = {}
+    exec(compile(new, "<t>", "exec"), ns)
+    check("inserted-line-is-REACHABLE", ns["Box"]().collect() == ["first", "second"])
+
+    # ...and the near-miss: append-to-defun lands after the return, so the value must NOT change.
+    # Without this the case above is equally consistent with any insertion anywhere.
+    new2, _, err2 = apply_form(
+        py,
+        "python",
+        ["append-to-defun", "collect", '        out.append("second")'],
+        OPS,
+    )
+    ns2: dict = {}
+    exec(compile(new2, "<t>", "exec"), ns2)
+    check(
+        "append-to-defun-is-UNREACHABLE (the documented limit)",
+        err2 == "" and ns2["Box"]().collect() == ["first"],
+    )
+
+    # REFUSES when the landmark is absent -- and the file is untouched.
+    _, _, err3 = apply_form(
+        py, "python", ["insert-in-defun", "collect", "zzz-not-here", "x"], OPS
+    )
+    check("no-landmark-refuses", err3 == "no-line-matching-in-defun")
+
+    # SCOPE IS REAL: `return` appears in both definitions, so an unscoped replace would hit two.
+    new4, n4, err4 = apply_form(
+        py, "python", ["replace-in-defun", "top", "return", "yield"], OPS
+    )
+    check("replace-in-defun-scoped-to-one", err4 == "" and n4 == 1)
+    check("replace-left-the-other-defun-alone", new4.count(b"return out") == 1)
+
+    # DELETE removes the whole definition and leaves no stranded blank line.
+    new5, _, err5 = apply_form(py, "python", ["delete-defun", "top"], OPS)
+    check("delete-defun-removes-it", err5 == "" and b"def top" not in new5)
+    check(
+        "delete-defun-leaves-parseable-source",
+        not get_parser("python").parse(new5).root_node.has_error,
+    )
+
+    # THE DECLARED DIVERGENCE, asserted in the direction that proves it: the identifier is renamed
+    # and the COMMENT mentioning it is not. If this ever starts matching the regexp backend, the
+    # divergence note above has gone stale and callers are being told the wrong thing.
+    new6, n6, e6 = apply_form(py, "python", ["rename-symbol", "collect", "gather"], OPS)
+    check("rename-applies-cleanly", e6 == "")
+    check("rename-touches-the-identifier", b"def gather" in new6)
+    # SPLIT INTO SEPARATE CASES, because mutation proved a compound assertion is weaker than it
+    # looks: `A and B` turned into `A or B` SURVIVED here, since either half alone still satisfies
+    # it. Two facts joined by `and` are one case pretending to be two.
+    check(
+        "rename-does-NOT-touch-a-comment (divergence from the regexp backend)",
+        b"# collect is mentioned here" in new6,
+    )
+    check("rename-renamed-EXACTLY-one-identifier", n6 == 1)
+
+    # THE SYNTAX GATE MUST BE ABLE TO FIRE. A gate with no failing case is an assertion.
+    _, _, err7 = apply_form(
+        py,
+        "python",
+        ["insert-in-defun", "collect", "return out", "        def ((("],
+        OPS,
+    )
+    check(
+        "introduced-syntax-error-is-REFUSED", err7 == "edit-introduced-a-syntax-error"
+    )
+
+    # ...and must NOT fire on a valid edit, or it would refuse everything and still look strict.
+    _, _, err8 = apply_form(
+        py,
+        "python",
+        ["insert-in-defun", "collect", "return out", "        pass"],
+        OPS,
+    )
+    check("valid-edit-passes-the-syntax-gate", err8 == "")
+
+    # EVERY LANGUAGE EDITS, not just python -- the whole claim of this file.
+    g, _, ge = apply_form(
+        FIXTURES["go"],
+        "go",
+        ["insert-in-defun", "Top", "return a", "\ta = a * 2"],
+        OPS,
+    )
+    check("go-edit-applies", ge == "")
+    check("go-edit-landed-the-text", b"a = a * 2" in g)
+    e, _, ee = apply_form(
+        FIXTURES["elisp"],
+        "elisp",
+        ["replace-in-defun", "my-fn", "(+ a 1)", "(+ a 2)"],
+        OPS,
+    )
+    check("elisp-edit-applies", ee == "")
+    check("elisp-edit-landed-the-text", b"(+ a 2)" in e)
+    b, _, be = apply_form(
+        FIXTURES["bash"],
+        "bash",
+        ["insert-in-defun", "top", "echo hi", "  echo pre"],
+        OPS,
+    )
+    check("bash-edit-applies", be == "")
+    check("bash-edit-landed-the-text", b"echo pre" in b)
+
+    # NON-DEFINING SPECIAL FORMS MUST NOT BE INDEXED, and the fixture had to be MEASURED to make
+    # this case mean anything. It used only `(if ...)`, which fails BOTH halves of the guard -- so
+    # it could not tell `and` from `or` there, and the weakened guard survived. `(setq a 1)` is the
+    # discriminating shape: its second element IS a symbol, so it gets indexed as a definition
+    # called "a" the instant the guard loosens. Found by mutation, not by re-reading the code.
+    ifs = definitions(b'(if (> a 1)\n  "big")\n(setq a 1)\n(let ((b 2)) b)\n', "elisp")
+    check("elisp-non-defining-special-forms-are-not-definitions", ifs == [])
+
+    # UNKNOWN EXTENSION REFUSES rather than guessing a grammar.
+    check("unknown-extension-has-no-grammar", lang_of("/tmp/x.rs") is None)
+    check("known-extension-resolves", lang_of("/tmp/x.py") == "python")
+
+    # THE OPEN ADDRESS. A query selects by SHAPE, so it reaches things no verb was minted for.
+    qsrc, qerr = _captures(
+        py, "python", "(function_definition name: (identifier) @n)", "n"
+    )
+    check("query-selects-by-shape", qerr == "" and len(qsrc) == 2)
+
+    # A QUERY THAT MATCHES NOTHING REFUSES, exactly like a string anchor with 0 matches: it means
+    # the belief about the file was wrong, and acting anyway would act on that wrong belief.
+    _, qerr2 = _captures(
+        py, "python", '((identifier) @x (#eq? @x "nonexistent_zzz"))', "x"
+    )
+    check("query-matching-nothing-REFUSES", qerr2 == "query-matched-nothing")
+
+    # A MALFORMED QUERY RETURNS ITS ERROR rather than raising -- the message IS the feedback loop.
+    _, qerr3 = _captures(py, "python", "(this_node_type_does_not_exist) @x", "x")
+    check("malformed-query-returns-an-error", qerr3.startswith("bad-query:"))
+
+    # ...and naming a capture the query never made must say WHICH ones it did make, or the caller
+    # cannot tell a typo in the capture name from a query that selected nothing.
+    _, qerr4 = _captures(py, "python", "(function_definition) @fn", "nope")
+    check("unknown-capture-names-the-real-ones", "@fn" in qerr4)
+
+    # THE OPEN ADDRESS EDITS, and multi-site: both functions get a decorator, in one form, with no
+    # anchor text quoted anywhere.
+    newq, nq, eq = apply_form(
+        py,
+        "python",
+        [
+            "query-insert-before",
+            "(function_definition name: (identifier) @n) @fn",
+            "fn",
+            "    # touched",
+        ],
+        OPS,
+    )
+    check("query-insert-before-hits-every-site", eq == "" and nq == 2)
+    check("query-insert-before-kept-it-parseable", newq.count(b"# touched") == 2)
+
+    # THE EXTENSION SET IS DECLARED, not implicit -- otherwise the drift guard would read a
+    # grammar-only op as divergence and refuse every edit.
+    check("extras-are-declared", set(EXTRA) <= set(IMPL))
+    check("extras-are-absent-from-the-shared-grammar", not (set(EXTRA) & set(OPS)))
+
+    # ARITY IS ENFORCED for extension ops too, by the same rules as the shared ones.
+    check("extra-op-wrong-arity-REFUSED", validate(["query-delete", "a"], OPS)[2] != "")
+    check(
+        "extra-op-right-arity-accepted",
+        validate(["query-delete", "a", "b"], OPS)[2] == "",
+    )
+
+    # THE WRITE HALF, which mutation showed was completely untested: `if write:` could be INVERTED
+    # and every case above still passed, because they all call apply_form directly and none of them
+    # ever touches a file. A structural editor that does not write is not an editor.
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "t.py")
+        ins = '(insert-in-defun "collect" "return out" "        pass")'
+
+        open(p, "wb").write(py)
+        rc1, m1 = edit_file(p, ins)
+        check(
+            "edit_file-WRITES-the-change", rc1 == 0 and b"pass" in open(p, "rb").read()
+        )
+        # A temp file is in no buffer, so this must take the DIRECT route -- and say so. Without
+        # naming the route the case cannot tell a cooperative write from an out-of-band one.
+        check("write-route-is-REPORTED", "via direct" in m1)
+
+        # ...and the near-miss, without which the case above cannot tell "writes" from "always
+        # writes": --stdout must leave the file byte-identical.
+        open(p, "wb").write(py)
+        sink = io.BytesIO()
+        rc2, _m2 = edit_file(p, ins, write=False, out=sink)
+        check(
+            "--stdout-does-NOT-write-the-file", rc2 == 0 and open(p, "rb").read() == py
+        )
+        check("--stdout-DOES-emit-the-edited-bytes", b"pass" in sink.getvalue())
+
+        rc3, m3 = edit_file(p, '(replace-in-defun "collect" "zzz-absent" "yyy")')
+        check("no-op-edit-is-REFUSED", rc3 == 1 and "no change" in m3)
+
+        rc4, m4 = edit_file(p, '(this-is-not-an-op "x")')
+        check("unknown-op-is-REFUSED", rc4 == 1 and "unknown op" in m4)
+
+        rc5, m5 = edit_file(p, "(insert-in-defun bad")
+        check("unreadable-form-is-REFUSED", rc5 == 1)
+        check("unreadable-form-SAYS-so", "unreadable" in m5)
+
+        # SHOW-DEFUN via the PATH wrapper (reads a real file -- the head's actual call shape).
+        open(p, "wb").write(py)
+        sdf = io.StringIO()
+        rcsd = show_defun(p, "top", out=sdf)
+        check(
+            "show-defun-PATH-wrapper-reads-and-serves",
+            rcsd == 0
+            and "def top" in sdf.getvalue()
+            and "class Box" not in sdf.getvalue(),
+        )
+
+    rc6, m6 = edit_file("/nonexistent/dir/x.py", '(delete-defun "a")')
+    check("missing-file-is-REFUSED", rc6 == 1 and "no-such-file" in m6)
+
+    # SHOW-DEFUN: byte-precise source serving BY NAME. The locate is shared with the edit ops, so
+    # these bind the byte-extraction and the read-path I/O (sink injected, like --stdout).
+    sd1 = io.StringIO()
+    check(
+        "show-defun-serves-the-named-def",
+        show_defun_src(py, "python", "top", out=sd1) == 0,
+    )
+    check(
+        "show-defun-returns-EXACT-def",
+        "def top" in sd1.getvalue() and "return a + 1" in sd1.getvalue(),
+    )
+    # ...and the near-miss: it must serve ONLY that def, not the rest of the file (the whole point).
+    check(
+        "show-defun-excludes-OTHER-defs",
+        "class Box" not in sd1.getvalue() and "def collect" not in sd1.getvalue(),
+    )
+    sd2 = io.StringIO()
+    check(
+        "show-defun-serves-a-method-by-bare-name",
+        show_defun_src(py, "python", "collect", out=sd2) == 0
+        and "def collect" in sd2.getvalue(),
+    )
+    sd3 = io.StringIO()
+    check(
+        "show-defun-REFUSES-unknown-name",
+        show_defun_src(py, "python", "nope", out=sd3) == 1
+        and "no-such-definition" in sd3.getvalue(),
+    )
+    # AMBIGUITY REFUSES for a read exactly as for a write -- serving the wrong def is the read twin
+    # of editing the wrong one.
+    sd4 = io.StringIO()
+    check(
+        "show-defun-REFUSES-ambiguous-name",
+        show_defun_src(dup, "python", "f", out=sd4) == 1
+        and "ambiguous" in sd4.getvalue(),
+    )
+
+    # THE DENOMINATOR IS WHAT RAN. A FLOOR guards the direction a derived count is blind to: if a
+    # case stops being reached, `n` shrinks with it and the suite would still print a clean N/N.
+    n = len(ran)
+    if n < 60:
+        fails.append("SUITE SHRANK -- %d cases ran, at least 60 expected" % n)
+    print("ts-edit --selftest: %d/%d cases" % (n - len(fails), n))
+    for f in fails:
+        print("  FAIL " + f)
+    return 1 if fails else 0
+
+
+def show(path, query_src, ctx=1):
+    """I/O. Print what a QUERY selects, with the lines around it, and return 0/1.
+
+    THE READ HALF OF THE LOOP, and it is not a convenience. A read head must emit the arguments its
+    action head requires: a query you cannot preview is one you have to GUESS at, and here the guess
+    does not come back as a wrong answer -- it lands as a WRITE. So this prints the two things the
+    action needs and nothing else can supply: the capture NAMES (which @name to pass) and the lines
+    each one selected (whether it selected what was meant).
+
+    The surrounding lines are the bearings. A capture shown alone is a fragment that looks right far
+    more often than it is right; one line of context is what makes a wrong selection visible.
+    """
+    lang = lang_of(path)
+    if lang is None:
+        print("no grammar for %s" % path)
+        return 1
+    src = open(path, "rb").read()
+    try:
+        q = ts.Query(get_language(lang), query_src)
+        caps = ts.QueryCursor(q).captures(get_parser(lang).parse(src).root_node)
+    except Exception as e:
+        print("bad-query: %s" % e)
+        return 1
+    if not caps:
+        print("query captured nothing -- no @name to act on")
+        return 1
+    lines = src.split(b"\n")
+    for cap in sorted(caps):
+        print("@%s -- %d node(s)" % (cap, len(caps[cap])))
+        for n in caps[cap]:
+            lo = src[: n.start_byte].count(b"\n")
+            hi = src[: n.end_byte].count(b"\n")
+            for i in range(max(0, lo - ctx), min(len(lines), hi + ctx + 1)):
+                mark = ">" if lo <= i <= hi else " "
+                print(
+                    "  %s %5d  %s" % (mark, i + 1, lines[i].decode("utf-8", "replace"))
+                )
+            print()
+    return 0
+
+
+def show_defun_src(src, lang, name, out=None):
+    """PURE-ish. Locate the definition named NAME and write its EXACT source bytes to OUT; 0/1.
+
+    BYTE-PRECISE SOURCE SERVING BY NAME -- the symbol-server case (an agent reads ONE definition,
+    not the whole file). The locate is the SAME `_scoped` the edit ops use, so this inherits the
+    ambiguity refusal for free: a name two definitions answer to is served to NO ONE and the
+    candidates are named, rather than one being picked silently -- a wrong address is exactly as
+    unacceptable for a read an agent will act on as for a write.
+    """
+    w = out or sys.stdout
+    node, beg, lim, err = _scoped(src, definitions(src, lang), name)
+    if err:
+        w.write(err + "\n")
+        return 1
+    lo = src[: node.start_byte].count(b"\n") + 1
+    hi = src[: node.end_byte].count(b"\n") + 1
+    body = src[node.start_byte : node.end_byte].decode("utf-8", "replace")
+    w.write(
+        "# %s  L%d-%d  (%d bytes)\n" % (name, lo, hi, node.end_byte - node.start_byte)
+    )
+    w.write(body if body.endswith("\n") else body + "\n")
+    return 0
+
+
+def show_defun(path, name, out=None):
+    """I/O. Read PATH and serve the definition named NAME (the head's actual call). Refuses with a
+    message rather than a traceback on a missing file or an unknown grammar, so a caller loop gets
+    feedback it can act on."""
+    w = out or sys.stdout
+    if not os.path.exists(path):
+        w.write("no-such-file: %s\n" % path)
+        return 1
+    lang = lang_of(path)
+    if lang is None:
+        w.write("no grammar for %s -- known: %s\n" % (path, ", ".join(sorted(EXT))))
+        return 1
+    return show_defun_src(open(path, "rb").read(), lang, name, out=out)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "--selftest":
+        return selftest()
+    if argv[0] == "--differential":
+        print(
+            "--differential is unavailable in the standalone build: it compares this tree-sitter "
+            "backend against the Emacs (emacs-edit + nerve-eval) backend, which this build does "
+            "not depend on. Run it in the substrate where both backends exist."
+        )
+        return 2
+    if argv[0] == "--show" and len(argv) >= 3:
+        return show(os.path.expanduser(argv[1]), argv[2])
+    if argv[0] == "--defun" and len(argv) >= 3:
+        return show_defun(os.path.expanduser(argv[1]), argv[2])
+    write = True
+    if argv[0] == "--stdout":
+        write, argv = False, argv[1:]
+    if len(argv) < 2:
+        print(__doc__.strip().splitlines()[0])
+        return 1
+    rc, msg = edit_file(os.path.expanduser(argv[0]), argv[1], write)
+    if msg:
+        print(msg)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

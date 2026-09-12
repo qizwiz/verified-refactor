@@ -1,0 +1,28 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "verified-refactor-marketplace",
+  "description": "A single-plugin marketplace for verified-refactor: oracle-gated, behavior-preserving code refactoring.",
+  "owner": {
+    "name": "Jonathan Hill",
+    "email": "jonathan.f.hill@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "verified-refactor",
+      "source": "./",
+      "description": "Structure proposes, the sound test oracle disposes. Tree-sitter proposes rewrites; each is kept only if your test suite still passes and the byte count drops, else reverted.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Jonathan Hill",
+        "email": "jonathan.f.hill@gmail.com"
+      },
+      "license": "MIT",
+      "keywords": [
+        "refactoring",
+        "tree-sitter",
+        "verification",
+        "test-oracle"
+      ]
+    }
+  ]
+}

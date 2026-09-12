@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""sx-mine -- learn a rewrite RULE from ONE (before, after) example by s-expr anti-unification.
+
+The GENERATE half of the autopoietic refactorer; `ts-refactor --rules` is the CERTIFY+APPLY half.
+Parse before+after to AST s-exprs; the CONTENT LEAVES carried through the rewrite become HOLES; the
+result is a (pattern, template) rule that generalizes over its operands -- one `x = x + 1 -> x += 1`
+example also rewrites `total = total + 3 -> total += 3`.
+
+NOT exhaustive, and nothing can be: program equivalence is undecidable and useful idioms are
+open-ended. This GROWS coverage -- one example, one rule -- oracle-certified downstream. A rule is
+itself data (an s-expr), so the rule SET is homoiconically manipulable.
+
+Honest limit: subtree-identity anti-unification generalizes over CARRIED operands, but keeps the
+transformed structure LITERAL -- so it mines one rule per operator (the `+` in `x=x+1` stays literal;
+mine `x=x-1 -> x-=1` for `-`). Generalizing over the transform needs tree-alignment (the next rung).
+
+  sx-mine "BEFORE" "AFTER" [--lang python]     -> rule JSON on stdout
+"""
+
+import json
+import sys
+
+from tree_sitter_language_pack import get_parser
+
+CONTENT = {
+    "identifier",
+    "integer",
+    "float",
+    "string",
+    "true",
+    "false",
+    "none",
+    "dotted_name",
+}
+
+
+def to_sx(node, b):
+    if node.child_count == 0:
+        return [
+            "L",
+            node.type,
+            b[node.start_byte : node.end_byte].decode("utf-8", "replace"),
+        ]
+    return ["N", node.type, [to_sx(c, b) for c in node.children]]
+
+
+_WRAP = {
+    "module",
+    "program",
+    "source_file",
+    "translation_unit",
+    "source",
+    "expression_statement",
+    "block",
+    "statement_block",
+    "compound_statement",
+}
+
+
+def core(node):
+    """Descend through single-named-child WRAPPERS to the meaningful node. The wrapper set spans
+    Python/JS/Go/C/... top-level + expression-statement nodes, so the miner works for every
+    tree-sitter language (the engine is grammar-agnostic; only these wrapper names are named).
+    """
+    while node.type in _WRAP and node.named_child_count == 1:
+        node = node.named_children[0]
+    return node
+
+
+def leaves(sx):
+    if sx[0] == "L":
+        yield sx
+    else:
+        for c in sx[2]:
+            yield from leaves(c)
+
+
+def abstract(sx, holemap):
+    if sx[0] == "L":
+        k = (sx[1], sx[2])
+        return ["H", holemap[k]] if k in holemap else sx
+    return ["N", sx[1], [abstract(c, holemap) for c in sx[2]]]
+
+
+def q_escape(s):
+    return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def gen_query(node, b, holemap, lits, counter):
+    """NATIVE tree-sitter query (s-expr) mirroring NODE -- the homoiconic rule form:
+    carried leaves -> (_) @hN holes (a repeated capture name IS the equality constraint,
+    applied downstream by ts-refactor); fixed content leaves -> typed + text-constrained
+    @_litN captures; anonymous tokens -> quoted literals (pinned exactly)."""
+    if node.child_count == 0:
+        txt = b[node.start_byte : node.end_byte].decode("utf-8", "replace")
+        if not node.is_named:
+            return q_escape(txt)
+        key = (node.type, txt)
+        if key in holemap:
+            return "(_) @h%d" % holemap[key]
+        n = counter[0]
+        counter[0] += 1
+        lits["_lit%d" % n] = txt
+        return "(%s) @_lit%d" % (node.type, n)
+    kids = " ".join(gen_query(c, b, holemap, lits, counter) for c in node.children)
+    return "(%s %s)" % (node.type, kids)
+
+
+def mine(before_src, after_src, lang="python"):
+    P = get_parser(lang)
+    bb, ab = before_src.encode(), after_src.encode()
+    bnode, anode = core(P.parse(bb).root_node), core(P.parse(ab).root_node)
+    bsx, asx = to_sx(bnode, bb), to_sx(anode, ab)
+    bset = {(l[1], l[2]) for l in leaves(bsx) if l[1] in CONTENT}
+    aset = {(l[1], l[2]) for l in leaves(asx) if l[1] in CONTENT}
+    holemap = {k: i for i, k in enumerate(sorted(bset & aset))}
+    pattern = abstract(bsx, holemap)
+    lits: dict = {}
+    query = gen_query(bnode, bb, holemap, lits, [0]) + " @_whole"
+    # template = after SOURCE with each carried content-leaf's byte-span replaced by a {i} marker
+    repls = []
+
+    def collect(n):
+        if n.child_count == 0:
+            key = (n.type, ab[n.start_byte : n.end_byte].decode("utf-8", "replace"))
+            if key in holemap:
+                repls.append((n.start_byte, n.end_byte, holemap[key]))
+        for c in n.children:
+            collect(c)
+
+    collect(anode)
+    repls.sort()
+    tpl, last = b"", anode.start_byte
+    for sb, eb, hid in repls:
+        tpl += ab[last:sb] + ("\x00%d\x00" % hid).encode()
+        last = eb
+    tpl += ab[last : anode.end_byte]
+    return {
+        "root": bnode.type,
+        "pattern": pattern,
+        "query": query,
+        "lits": lits,
+        "template": tpl.decode("utf-8", "replace"),
+        "holes": len(holemap),
+        "example": [before_src, after_src],
+    }
+
+
+def _selftest():
+    """Discrimination cases over mine(): they prove the miner GENERALIZES over carried operands
+    yet keeps the transform LITERAL (the documented one-rule-per-operator limit). A case that only
+    asserted a non-empty dict would pass on a broken miner; each case below can fail by itself.
+    """
+    r = mine("x = x + 1", "x += 1")
+    r2 = mine("total = total + 3", "total += 3")  # same rule, different operands
+    r3 = mine("y = y - 1", "y -= 1")  # different operator -> MUST be a different rule
+    cases = [
+        ("two-holes", r["holes"] == 2),
+        ("root-assignment", r["root"] == "assignment"),
+        ("equality-constraint", r["query"].count("@h0") == 2),
+        ("template-has-markers", "\x00" in r["template"]),
+        ("generalizes-over-operands", r2["query"] == r["query"]),
+        ("operator-stays-literal", r3["query"] != r["query"]),
+    ]
+    passed = sum(1 for _, ok in cases if ok)
+    for name, ok in cases:
+        print("  %s %s" % ("ok  " if ok else "FAIL", name))
+    total = len(cases)
+    print(
+        "RESULT: %s -- sx-mine selftest (%d/%d cases)"
+        % ("PASS" if passed == total else "FAIL", passed, total)
+    )
+    return 0 if passed == total else 1
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] == "--selftest":
+        return _selftest()
+    if len(a) < 2:
+        print(
+            'usage: sx-mine "BEFORE" "AFTER" [--lang L] | --selftest', file=sys.stderr
+        )
+        return 2
+    lang = a[a.index("--lang") + 1] if "--lang" in a else "python"
+    print(json.dumps(mine(a[0], a[1], lang)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,28 @@
+{
+  "name": "verified-refactor",
+  "version": "0.1.0",
+  "description": "Verified behavior-preserving refactoring: structure proposes, the sound test oracle disposes. Tree-sitter finds rewrite sites; each candidate is applied only if your own test suite still passes AND the code gets smaller, otherwise it is reverted.",
+  "author": {
+    "name": "Jonathan Hill",
+    "url": "https://github.com/qizwiz/verified-refactor"
+  },
+  "homepage": "https://github.com/qizwiz/verified-refactor",
+  "license": "MIT",
+  "keywords": [
+    "refactoring",
+    "tree-sitter",
+    "verification",
+    "test-oracle",
+    "behavior-preserving",
+    "mcp"
+  ],
+  "mcpServers": {
+    "verified-refactor": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp_server.py"
+      ]
+    }
+  },
+  "hooks": "./hooks/hooks.json"
+}
