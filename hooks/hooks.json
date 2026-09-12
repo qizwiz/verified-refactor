@@ -1,0 +1,17 @@
+{
+  "//": "Claude Code PreToolUse hooks: the verification moat for the ts_refactor / show_defun MCP tools. The matcher is a coarse filter (matched against the tool name; written to work whether the name is bare `ts_refactor` or MCP-qualified `mcp__server__ts_refactor`, and under both re.search and re.fullmatch). oracle-gate.py is the real decision: it BLOCKS a refactor whose target repo's declared test oracle (.oracle-gate.json) is red, and ALLOWS reads and green baselines. Paths resolve via CLAUDE_PLUGIN_ROOT (plugin layout) with a CLAUDE_PROJECT_DIR fallback. Set a generous hook timeout so a slow suite yields the hook's own clean `block: oracle timed out` rather than the harness killing the hook; oracle-gate caps the inner test-command timeout at 280s, below this.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*(ts_refactor|show_defun).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT:-${CLAUDE_PROJECT_DIR:-.}}/hooks/oracle-gate.py\"",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}
