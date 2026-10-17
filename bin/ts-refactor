@@ -21,6 +21,8 @@ Rules (Python, extensible registry):
 """
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,12 @@ NEG_CMP = {
     "in": "not in",
     "not in": "in",
 }
+
+
+# Last VERIFIED bytes of FILE, kept next to it while a run is in flight. A candidate must be on disk
+# for the oracle to grade it, so a run killed mid-grade (SIGKILL, power loss) would otherwise leave
+# an UNGRADED rewrite in place with no record of what was certified. Removed on every clean exit.
+BACKUP_SUFFIX = ".ts-refactor-verified"
 
 
 def _t(b, n):
@@ -101,6 +109,11 @@ def _query_candidates(tree, b, rule, lang):
         for hid, txt in hole_txt.items():
             rep = rep.replace("\x00%d\x00" % hid, txt)
         w = caps["_whole"][0]
+        # tree-sitter query children are NOT anchored: `(comparison_operator (_) @h0 "==" (false))`
+        # also matches `a == b == False` by skipping `b`. Confirm against the rule's exact-positional
+        # pattern (same holes, any subtree) so the generator only proposes the shape it was mined from.
+        if rule.get("pattern") and not _match_rule(rule["pattern"], w, b, {}):
+            continue
         out.append(
             (
                 w.start_byte,
@@ -126,7 +139,17 @@ def find_candidates(tree, b, rules=(), lang="python"):
         if n.type == "assignment":
             l = n.child_by_field_name("left")
             r = n.child_by_field_name("right")
-            if l and r and l.type == "identifier" and r.type == "binary_operator":
+            # `y = x = x + 1` -> `y = x += 1` is a syntax error, and `x: T = x + 1` -> `x += 1`
+            # drops the annotation: only rewrite a plain, un-annotated, top-of-statement assignment.
+            stmt = n.parent is not None and n.parent.type in ("expression_statement", "module", "block")
+            if (
+                stmt
+                and n.child_by_field_name("type") is None
+                and l
+                and r
+                and l.type == "identifier"
+                and r.type == "binary_operator"
+            ):
                 rl = r.child_by_field_name("left")
                 rr = r.child_by_field_name("right")
                 ops = [c for c in r.children if not c.is_named]
@@ -218,7 +241,34 @@ def find_candidates(tree, b, rules=(), lang="python"):
             walk(c)
 
     walk(tree.root_node)
-    return out
+    seen, uniq = set(), []
+    for c in out:  # one site can be matched by several query patterns / rules
+        if c[:3] not in seen:
+            seen.add(c[:3])
+            uniq.append(c)
+    return uniq
+
+
+def _parses(src, parser, lang):
+    """True if SRC is syntactically valid. Python uses compile(): tree-sitter is lenient and parses
+    `y = x += 1` without an ERROR node. Other grammars fall back to tree-sitter's has_error."""
+    if lang == "python":
+        try:
+            compile(src, "<candidate>", "exec", dont_inherit=True)
+            return True
+        except (SyntaxError, ValueError):
+            return False
+    return not parser.parse(src).root_node.has_error
+
+
+def _write_atomic(path, data):
+    tmp = path.with_name(path.name + ".ts-refactor-tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _raise_exit(signum, _frame):
+    raise SystemExit(128 + signum)
 
 
 def run_test(cmd, timeout):
@@ -238,6 +288,21 @@ def refactor(
 ):
     parser = get_parser(lang)
     p = Path(path)
+    backup = p.with_name(p.name + BACKUP_SUFFIX)
+    if backup.exists():
+        print(
+            json.dumps(
+                {
+                    "event": "HARNESS-ERROR",
+                    "control": "interrupted-run",
+                    "note": "%s exists: a previous run was killed mid-grade, so %s may hold an "
+                    "UNGRADED candidate. Its last verified bytes are in %s -- restore them "
+                    "(mv %s %s) or delete the backup after reviewing the file."
+                    % (backup.name, p.name, backup.name, backup, p),
+                }
+            )
+        )
+        return 2
     orig = p.read_bytes()
     if not dry and not run_test(test_cmd, timeout):
         print(
@@ -251,7 +316,15 @@ def refactor(
         )
         return 2
     cur = orig
+    # A candidate that does not parse while the original does was never a refactoring; refuse it
+    # before the oracle can be fooled by a suite that never imports this file.
+    check_syntax = _parses(orig, parser, lang)
     applied, rejected = [], []
+    # SIGTERM/SIGHUP (an MCP client timing out, a CI cancel) must unwind through `finally`, which
+    # restores the last verified bytes -- the default action kills us with the candidate on disk.
+    prev = {s: signal.signal(s, _raise_exit) for s in (signal.SIGTERM, signal.SIGHUP)}
+    if not dry:
+        _write_atomic(backup, orig)
     try:
         for _ in range(max_apply + 5):
             cands = find_candidates(parser.parse(cur), cur, rules, lang)
@@ -260,6 +333,12 @@ def refactor(
                 for c in cands
                 if len(cur[: c[0]] + c[2].encode() + cur[c[1] :]) < len(cur)
             ]
+            if check_syntax:
+                cands = [
+                    c
+                    for c in cands
+                    if _parses(cur[: c[0]] + c[2].encode() + cur[c[1] :], parser, lang)
+                ]
             if dry:
                 for _sb, _eb, _rep, label in sorted(cands):
                     print(json.dumps({"event": "candidate", "rule": label}))
@@ -270,6 +349,7 @@ def refactor(
                 p.write_bytes(newb)
                 if run_test(test_cmd, timeout):
                     cur = newb
+                    _write_atomic(backup, cur)
                     applied.append(label)
                     progressed = True
                     print(
@@ -292,7 +372,11 @@ def refactor(
             if not progressed or len(applied) >= max_apply:
                 break
     finally:
-        p.write_bytes(orig if dry else cur)
+        if not dry:
+            p.write_bytes(cur)
+            backup.unlink(missing_ok=True)
+        for s, h in prev.items():
+            signal.signal(s, h)
     print(
         json.dumps(
             {

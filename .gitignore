@@ -7,3 +7,5 @@ __pycache__/
 *.orig
 bench/last-receipt.json
 *.orig
+*.ts-refactor-verified
+*.ts-refactor-tmp
