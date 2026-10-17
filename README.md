@@ -48,7 +48,7 @@ data whose failures were inspected during tuning is a memory, not a measurement.
 | `bin/ts-edit` (`--defun NAME`) | Serve a definition's **exact current source by name**, byte-precise — read before you rewrite, so you never guess an anchor. Exposed as the MCP tool `show_defun`. |
 | `bin/sx-mine` | **Generate.** Learn a rewrite *rule* from one `(before, after)` example via s-expr anti-unification; feed the rule to `ts-refactor --rules` to certify + apply it at new sites. Exposed as the MCP tool `sx_mine`. |
 | `mcp_server.py` | stdio MCP server exposing three tools (underscored names): `show_defun(file, name)`, `ts_refactor(file, test_cmd)`, and `sx_mine(before, after, lang)`. Each shells to the matching `bin/` binary. |
-| `hooks/hooks.json` | A `PreToolUse` hook (matcher `.*(ts_refactor\|show_defun).*`) that blocks a refactor when the target repo's declared test oracle is red, so an un-graded rewrite can't land. |
+| `hooks/hooks.json` | A `PreToolUse` hook (matcher `.*(ts_refactor\|show_defun).*`) that blocks a refactor when the target repo's declared test oracle is red, or when the call carries a `test_cmd` other than the repo's, so an un-graded rewrite can't land. |
 
 > Note: `mcp_server.py` and `hooks/hooks.json` are the integration layer over the `bin/` tools;
 > see **Status** below for which pieces are present in this build. The MCP tool names are

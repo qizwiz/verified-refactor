@@ -322,7 +322,8 @@ def refactor(
     applied, rejected = [], []
     # SIGTERM/SIGHUP (an MCP client timing out, a CI cancel) must unwind through `finally`, which
     # restores the last verified bytes -- the default action kills us with the candidate on disk.
-    prev = {s: signal.signal(s, _raise_exit) for s in (signal.SIGTERM, signal.SIGHUP)}
+    sigs = [x for x in (signal.SIGTERM, getattr(signal, "SIGHUP", None)) if x]
+    prev = {s: signal.signal(s, _raise_exit) for s in sigs}
     if not dry:
         _write_atomic(backup, orig)
     try:
