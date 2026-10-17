@@ -17,8 +17,11 @@ fix. Read-only calls (`show_defun`) are never gated and never trigger a test run
   THE ORACLE IS UN-FAKEABLE BY CONSTRUCTION:
     The test command is read from the REPO (`.oracle-gate.json` at / above the target file's dir),
     NEVER from `tool_input`. tool_input is authored by the same model that wants to refactor; a
-    caller-supplied `test_cmd: "true"` would make the moat theater (the self-grant shape). If a
-    caller DOES pass an oracle-shaped key, it is IGNORED and the refusal says so.
+    caller-supplied `test_cmd: "true"` would make the moat theater (the self-grant shape). The
+    baseline decision never reads it -- but ts_refactor GRADES EVERY CANDIDATE with the test_cmd it
+    is called with, so ignoring a mismatched one would certify the repo oracle and then let the
+    caller's oracle decide what lands. A caller oracle key that differs from the repo's test_cmd is
+    therefore BLOCKED outright (omit it, or pass exactly the repo's value).
 
   PROTOCOL (Claude Code PreToolUse):
     stdin  : one JSON object -- {session_id, cwd, hook_event_name, tool_name, tool_input, ...}
@@ -217,6 +220,18 @@ def decide(payload):
         }
 
     repo_dir, test_cmd, timeout = resolved
+    if ignored:
+        supplied = tool_input.get(ignored)
+        if not isinstance(supplied, str) or supplied.strip() != test_cmd:
+            return {
+                "decision": "block",
+                "reason": f"oracle-gate: caller-supplied {ignored}={supplied!r} does not match the "
+                f"repo's verification oracle `{test_cmd}` ({os.path.join(repo_dir, ORACLE_FILE)}). "
+                f"The refactor tool grades every candidate with the command it is called with, so a "
+                f"different one would decide what lands. Omit {ignored!r} or pass exactly the repo's "
+                f"test_cmd.",
+            }
+        ign_note = f" (caller-supplied {ignored!r} matches the repo oracle)"
     try:
         ok, rc, tail = run_oracle(test_cmd, repo_dir, timeout)
     except Exception as e:  # noqa: BLE001  (fail-closed: any fault blocks)
@@ -446,12 +461,30 @@ def selftest():
         )
         dec_fake = _parse_decision(out_fake)
         check(
-            "caller-supplied test_cmd:'true' is IGNORED -> still blocked by repo oracle",
+            "caller-supplied test_cmd:'true' never wins -> still blocked by repo oracle",
             bool(dec_fake) and dec_fake.get("decision") == "block",
         )
         check(
-            "block reason says the caller oracle was ignored",
-            bool(dec_fake) and "ignored caller-supplied" in dec_fake.get("reason", ""),
+            "block reason names the caller oracle it refused",
+            bool(dec_fake) and "caller-supplied" in dec_fake.get("reason", ""),
+        )
+
+        # 5b) ...and with a GREEN repo oracle the mismatch alone blocks: ts_refactor would grade
+        #     every candidate with `true`, so a green baseline must not wave it through.
+        with open(oracle_path, "w", encoding="utf-8") as fh:
+            json.dump({"test_cmd": pass_cmd}, fh)
+        out_fake2, _ = _run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": repo,
+                "tool_name": "ts_refactor",
+                "tool_input": {"file": "mod.py", "test_cmd": "true"},
+            }
+        )
+        dec_fake2 = _parse_decision(out_fake2)
+        check(
+            "GREEN repo oracle + mismatched caller test_cmd -> block",
+            bool(dec_fake2) and dec_fake2.get("decision") == "block",
         )
 
         # 6) MISCONFIGURED oracle (present but no test_cmd) -> BLOCK, not a crash.

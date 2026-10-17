@@ -61,6 +61,11 @@ bin/ts-refactor path/to/module.py --test 'pytest -q' --max 10 --timeout 120
 `--dry`. Through the MCP tool, `ts_refactor(file, test_cmd)` always applies in place with the
 given test — the `--dry`, `--rules`, `--max`, and `--selftest` flags are **CLI-only**.
 
+If a `.oracle-gate.json` governs the file, **its** `test_cmd` is the oracle: the MCP tool runs it
+from that repo's directory, `test_cmd` may be omitted, and a different `test_cmd` is refused (as is
+the hook). A run killed mid-grade leaves `<file>.ts-refactor-verified` holding the last verified
+bytes; `ts-refactor` refuses to run on that file until you restore or remove it.
+
 ### Optional: mine a rule, then certify it (`sx-mine` → `ts-refactor --rules`)
 
 To teach a new rewrite from a single example, mine a rule and feed it back in:
